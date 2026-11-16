@@ -1,4 +1,4 @@
-name: NexusIQ CI/CD
+name: SiriusIQ CI/CD
 
 on:
   push:
@@ -76,7 +76,7 @@ jobs:
           echo "✅ Frontend package structure validated."
 
   build-status:
-    name: NexusIQ Build Status
+    name: SiriusIQ Build Status
     needs: [validate-docker, validate-backend, validate-frontend]
     runs-on: ubuntu-latest
     if: always()
@@ -89,4 +89,4 @@ jobs:
             echo "❌ CI validation failed on one or more jobs."
             exit 1
           fi
-          echo "🚀 All NexusIQ CI/CD checks passed successfully!"
+          echo "🚀 All SiriusIQ CI/CD checks passed successfully!"
