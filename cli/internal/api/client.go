@@ -1,0 +1,543 @@
+// Package api provides the HTTP client for communicating with the Onyx server.
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/onyx-dot-app/onyx/cli/internal/config"
+	"github.com/onyx-dot-app/onyx/cli/internal/models"
+)
+
+// Client is the Onyx API client.
+//
+// Each call site picks an http.Client with a timeout matched to its expected
+// work: 3min for quick JSON endpoints, 5min for /search (which runs LLM query
+// expansion + relevance selection) and uploads, and 6min for image generation.
+// Chat streams have no total timeout: a turn can run for many minutes, so
+// streamIdleTimeout bounds each wait for data instead.
+type Client struct {
+	baseURL           string
+	apiKey            string
+	httpClient        *http.Client
+	searchHTTPClient  *http.Client
+	uploadHTTPClient  *http.Client
+	streamHTTPClient  *http.Client
+	imageHTTPClient   *http.Client
+	streamIdleTimeout time.Duration
+}
+
+// NewClient creates a new API client from config.
+// ServerURL may be a server origin or an API base that already includes the
+// configured API prefix.
+func NewClient(cfg config.OnyxCliConfig) *Client {
+	var transport *http.Transport
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = t.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	return &Client{
+		baseURL: config.APIURL(cfg.ServerURL),
+		apiKey:  cfg.APIKey,
+		httpClient: &http.Client{
+			Timeout:   3 * time.Minute,
+			Transport: transport,
+		},
+		searchHTTPClient: &http.Client{
+			Timeout:   5 * time.Minute,
+			Transport: transport,
+		},
+		uploadHTTPClient: &http.Client{
+			Timeout:   5 * time.Minute,
+			Transport: transport,
+		},
+		streamHTTPClient: &http.Client{Transport: transport},
+		// The server sends a heartbeat every 15 seconds while a turn has no output.
+		streamIdleTimeout: 2 * time.Minute,
+		// Must exceed the server's 5-minute image-generation stream ceiling,
+		// or the client gives up before the server's timeout envelope arrives.
+		imageHTTPClient: &http.Client{
+			Timeout:   6 * time.Minute,
+			Transport: transport,
+		},
+	}
+}
+
+func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		bearer := "Bearer " + c.apiKey
+		req.Header.Set("Authorization", bearer)
+		req.Header.Set("X-Onyx-Authorization", bearer)
+	}
+	return req, nil
+}
+
+func checkResponse(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if isHTMLResponse(resp.Header.Get("Content-Type"), body) {
+		return &OnyxAPIError{
+			StatusCode: resp.StatusCode,
+			Detail:     "server returned HTML instead of JSON — check that your server URL is correct",
+		}
+	}
+	apiErr := &OnyxAPIError{StatusCode: resp.StatusCode, Detail: string(body)}
+	// Onyx errors carry {"error_code", "detail"}; other errors keep the raw body.
+	var structured struct {
+		ErrorCode string `json:"error_code"`
+		Detail    any    `json:"detail"`
+	}
+	if json.Unmarshal(body, &structured) == nil && structured.ErrorCode != "" {
+		apiErr.ErrorCode = structured.ErrorCode
+		if detail, ok := structured.Detail.(string); ok && detail != "" {
+			apiErr.Detail = detail
+		}
+	}
+	return apiErr
+}
+
+func isHTMLResponse(contentType string, body []byte) bool {
+	if strings.Contains(contentType, "text/html") {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(string(body)))
+	return strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html")
+}
+
+func wrapTimeoutError(err error) error {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &OnyxAPIError{StatusCode: 408, Detail: fmt.Sprintf("request timed out: %v", err)}
+	}
+	return err
+}
+
+func (c *Client) doJSONWith(ctx context.Context, httpClient *http.Client, method, path string, reqBody any, result any) error {
+	var body io.Reader
+	if reqBody != nil {
+		data, err := json.Marshal(reqBody)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(data)
+	}
+
+	req, err := c.newRequest(ctx, method, path, body)
+	if err != nil {
+		return err
+	}
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return wrapTimeoutError(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := checkResponse(resp); err != nil {
+		return err
+	}
+
+	if result != nil {
+		return json.NewDecoder(resp.Body).Decode(result)
+	}
+	return nil
+}
+
+func (c *Client) doJSON(ctx context.Context, method, path string, reqBody any, result any) error {
+	return c.doJSONWith(ctx, c.httpClient, method, path, reqBody, result)
+}
+
+// Search calls POST /api/search and returns the response.
+func (c *Client) Search(ctx context.Context, req models.SearchRequest) (*models.SearchResponse, error) {
+	var resp models.SearchResponse
+	if err := c.doJSONWith(ctx, c.searchHTTPClient, "POST", "/search", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GenerateImage calls POST /image-generation/generate, which generates
+// image(s) using the workspace's default image-gen provider.
+//
+// The server streams keepalive whitespace before the JSON body (which
+// json.Decoder skips) and reports errors in-band on a 200, since the status
+// line is already committed when a slow generation fails.
+func (c *Client) GenerateImage(ctx context.Context, req models.ImageGenerationRequest) (*models.ImageGenerationResponse, error) {
+	var resp struct {
+		models.ImageGenerationResponse
+		ErrorCode string `json:"error_code"`
+		Detail    string `json:"detail"`
+	}
+	if err := c.doJSONWith(ctx, c.imageHTTPClient, "POST", "/image-generation/generate", req, &resp); err != nil {
+		return nil, err
+	}
+	if resp.ErrorCode != "" {
+		var statusCode int
+		switch resp.ErrorCode {
+		case "NOT_FOUND":
+			statusCode = 404
+		case "INVALID_INPUT":
+			statusCode = 400
+		case "GATEWAY_TIMEOUT":
+			statusCode = 504
+		default:
+			statusCode = 502
+		}
+		return nil, &OnyxAPIError{StatusCode: statusCode, Detail: resp.Detail}
+	}
+	if len(resp.Images) == 0 {
+		return nil, &OnyxAPIError{StatusCode: 502, Detail: "server returned no images"}
+	}
+	return &resp.ImageGenerationResponse, nil
+}
+
+// TestConnection checks if the server is reachable and credentials are valid.
+// Returns nil on success, or an error with a descriptive message on failure.
+func (c *Client) TestConnection(ctx context.Context) error {
+	// Step 1: Basic reachability
+	req, err := c.newRequest(ctx, "GET", "/", nil)
+	if err != nil {
+		return fmt.Errorf("cannot connect to %s: %w", c.baseURL, err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cannot connect to %s — is the server running?", c.baseURL)
+	}
+	_ = resp.Body.Close()
+
+	serverHeader := strings.ToLower(resp.Header.Get("Server"))
+
+	if resp.StatusCode == 403 {
+		if strings.Contains(serverHeader, "awselb") || strings.Contains(serverHeader, "amazons3") {
+			return &AuthError{Message: "blocked by AWS load balancer (HTTP 403 on all requests).\n  Your IP address may not be in the ALB's security group or WAF allowlist"}
+		}
+		return &AuthError{Message: "HTTP 403 on base URL — the server is blocking all traffic.\n  This is likely a firewall, WAF, or IP allowlist restriction"}
+	}
+
+	// Step 2: Authenticated check
+	req2, err := c.newRequest(ctx, "GET", "/me", nil)
+	if err != nil {
+		return fmt.Errorf("server reachable but API error: %w", err)
+	}
+
+	resp2, err := c.httpClient.Do(req2)
+	if err != nil {
+		return fmt.Errorf("server reachable but API error: %w", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+
+	if resp2.StatusCode == 200 {
+		return nil
+	}
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp2.Body, 300))
+	body := string(bodyBytes)
+	isHTML := strings.HasPrefix(strings.TrimSpace(body), "<")
+	respServer := strings.ToLower(resp2.Header.Get("Server"))
+
+	if resp2.StatusCode == 401 || resp2.StatusCode == 403 {
+		if isHTML || strings.Contains(respServer, "awselb") {
+			return &AuthError{Message: fmt.Sprintf("HTTP %d from a reverse proxy (not the Onyx backend).\n  Check your deployment's ingress / proxy configuration", resp2.StatusCode)}
+		}
+		if resp2.StatusCode == 401 {
+			return &AuthError{Message: fmt.Sprintf("invalid personal access token.\n  %s", body)}
+		}
+		return &AuthError{Message: fmt.Sprintf("access denied — check that the personal access token is valid.\n  %s", body)}
+	}
+
+	detail := fmt.Sprintf("HTTP %d", resp2.StatusCode)
+	if body != "" {
+		detail += fmt.Sprintf("\n  Response: %s", body)
+	}
+	return &OnyxAPIError{StatusCode: resp2.StatusCode, Detail: detail}
+}
+
+// ListAgents returns visible agents.
+func (c *Client) ListAgents(ctx context.Context) ([]models.AgentSummary, error) {
+	var raw []models.AgentSummary
+	if err := c.doJSON(ctx, "GET", "/persona", nil, &raw); err != nil {
+		return nil, err
+	}
+	var result []models.AgentSummary
+	for _, p := range raw {
+		if p.IsVisible {
+			result = append(result, p)
+		}
+	}
+	return result, nil
+}
+
+// ListDocumentSets returns the document sets the current user can search.
+func (c *Client) ListDocumentSets(ctx context.Context) ([]models.DocumentSetSummary, error) {
+	var result []models.DocumentSetSummary
+	if err := c.doJSON(ctx, "GET", "/manage/document-set?searchable_only=true", nil, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ListLLMProviders returns LLM providers (with their models) accessible to
+// the current user, plus the workspace default model.
+func (c *Client) ListLLMProviders(ctx context.Context) (*models.LLMProviderResponse, error) {
+	var resp models.LLMProviderResponse
+	if err := c.doJSON(ctx, "GET", "/llm/provider", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ListChatSessions returns recent chat sessions.
+func (c *Client) ListChatSessions(ctx context.Context) ([]models.ChatSessionDetails, error) {
+	var resp struct {
+		Sessions []models.ChatSessionDetails `json:"sessions"`
+	}
+	if err := c.doJSON(ctx, "GET", "/chat/get-user-chat-sessions", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Sessions, nil
+}
+
+// GetChatSession returns full details for a session.
+func (c *Client) GetChatSession(ctx context.Context, sessionID string) (*models.ChatSessionDetailResponse, error) {
+	var resp models.ChatSessionDetailResponse
+	if err := c.doJSON(ctx, "GET", "/chat/get-chat-session/"+sessionID, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// RenameChatSession renames a session. If name is empty, the backend auto-generates one.
+func (c *Client) RenameChatSession(ctx context.Context, sessionID string, name *string) (string, error) {
+	payload := map[string]any{
+		"chat_session_id": sessionID,
+	}
+	if name != nil {
+		payload["name"] = *name
+	}
+	var resp struct {
+		NewName string `json:"new_name"`
+	}
+	if err := c.doJSON(ctx, "PUT", "/chat/rename-chat-session", payload, &resp); err != nil {
+		return "", err
+	}
+	return resp.NewName, nil
+}
+
+// UploadFile uploads a file and returns a file descriptor.
+func (c *Client) UploadFile(ctx context.Context, filePath string) (*models.FileDescriptorPayload, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	part, err := writer.CreateFormFile("files", filepath.Base(filePath))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return nil, err
+	}
+	_ = writer.Close()
+
+	req, err := c.newRequest(ctx, "POST", "/user/projects/file/upload", &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := c.uploadHTTPClient.Do(req)
+	if err != nil {
+		return nil, wrapTimeoutError(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var snapshot models.CategorizedFilesSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
+		return nil, err
+	}
+
+	if len(snapshot.UserFiles) == 0 {
+		return nil, &OnyxAPIError{StatusCode: 400, Detail: "File upload returned no files"}
+	}
+
+	uf := snapshot.UserFiles[0]
+	return &models.FileDescriptorPayload{
+		ID:   uf.FileID,
+		Type: uf.ChatFileType,
+		Name: filepath.Base(filePath),
+	}, nil
+}
+
+// GetBackendVersion fetches the backend version string.
+func (c *Client) GetBackendVersion(ctx context.Context) (string, error) {
+	var resp struct {
+		BackendVersion string `json:"backend_version"`
+	}
+	if err := c.doJSON(ctx, "GET", "/version", nil, &resp); err != nil {
+		return "", err
+	}
+	return resp.BackendVersion, nil
+}
+
+// StopChatSession sends a stop signal for a streaming session (best-effort).
+func (c *Client) StopChatSession(ctx context.Context, sessionID string, streamID int) {
+	req, err := c.newRequest(ctx, "POST", fmt.Sprintf("/chat/stop-chat-session/%s?stream_id=%d", sessionID, streamID), nil)
+	if err != nil {
+		return
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return
+	}
+	_ = resp.Body.Close()
+}
+
+// DecideApproval answers a tool approval request and returns the decision the
+// server saved. An error for which IsApprovalNoLongerWaiting is true means the
+// request no longer waits.
+func (c *Client) DecideApproval(ctx context.Context, approvalID string, decision models.ApprovalDecision) (models.ApprovalDecisionResult, error) {
+	body := map[string]models.ApprovalDecision{"decision": decision}
+	var result models.ApprovalDecisionResult
+	err := c.doJSON(ctx, "POST", "/chat/approvals/"+url.PathEscape(approvalID)+"/decision", body, &result)
+	return result, err
+}
+
+// ChatSessionStatus confirms whether the server still owns the session. A
+// failed query reports a running session.
+func (c *Client) ChatSessionStatus(ctx context.Context, sessionID string) (models.ChatSessionStatus, error) {
+	var status struct {
+		IsProcessing       *bool              `json:"is_processing"`
+		CurrentStream      *models.ChatStream `json:"current_stream"`
+		ApprovalsVersion   string             `json:"approvals_version"`
+		HasActiveSubagents bool               `json:"has_active_subagents"`
+		HasStartableInput  bool               `json:"has_startable_input"`
+		LatestResponseID   *int               `json:"latest_response_id"`
+	}
+	unknown := models.ChatSessionStatus{IsProcessing: true}
+	if err := c.doJSON(ctx, "GET", "/chat/chat-session/"+sessionID+"/status", nil, &status); err != nil {
+		var apiErr *OnyxAPIError
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusMethodNotAllowed) {
+			return unknown, fmt.Errorf("session or readiness endpoint unavailable; use a server with the chat readiness API: %w", err)
+		}
+		return unknown, err
+	}
+	if status.IsProcessing == nil {
+		return unknown, fmt.Errorf("invalid chat readiness response")
+	}
+	return models.ChatSessionStatus{
+		IsProcessing:       *status.IsProcessing,
+		CurrentStream:      status.CurrentStream,
+		ApprovalsVersion:   status.ApprovalsVersion,
+		HasActiveSubagents: status.HasActiveSubagents,
+		HasStartableInput:  status.HasStartableInput,
+		LatestResponseID:   status.LatestResponseID,
+	}, nil
+}
+
+// StatusPollInterval paces the status reads that wait for the server.
+var StatusPollInterval = time.Second
+
+// WaitForChatSessionIdle keeps completion separate from delivery.
+func WaitForChatSessionIdle(ctx context.Context, client ClientAPI, sessionID string) error {
+	for {
+		status, err := client.ChatSessionStatus(ctx, sessionID)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil && !IsRetryableReadinessError(err) {
+			return err
+		}
+		if err == nil && !status.IsProcessing {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(StatusPollInterval):
+		}
+	}
+}
+
+// FollowResponse reads the session status until a stream other than
+// streamID writes the response responseID, and returns that stream. While
+// another turn holds the session, the status reports processing, so the
+// read continues. It returns nil once the session is idle: the saved session
+// then shows how the response went on.
+func FollowResponse(ctx context.Context, client ClientAPI, sessionID string, responseID, streamID int) (*models.ChatStream, error) {
+	for {
+		status, err := client.ChatSessionStatus(ctx, sessionID)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil && !IsRetryableReadinessError(err) {
+			return nil, err
+		}
+		if err == nil {
+			current := status.CurrentStream
+			if current != nil && current.StreamID != streamID && slices.Contains(current.ResponseIDs, responseID) {
+				return current, nil
+			}
+			if !status.IsProcessing {
+				return nil, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(StatusPollInterval):
+		}
+	}
+}
+
+// ClientAPI is the interface satisfied by Client.
+type ClientAPI interface {
+	TestConnection(ctx context.Context) error
+	ListAgents(ctx context.Context) ([]models.AgentSummary, error)
+	ListLLMProviders(ctx context.Context) (*models.LLMProviderResponse, error)
+	ListChatSessions(ctx context.Context) ([]models.ChatSessionDetails, error)
+	GetChatSession(ctx context.Context, sessionID string) (*models.ChatSessionDetailResponse, error)
+	RenameChatSession(ctx context.Context, sessionID string, name *string) (string, error)
+	UploadFile(ctx context.Context, filePath string) (*models.FileDescriptorPayload, error)
+	GetBackendVersion(ctx context.Context) (string, error)
+	StopChatSession(ctx context.Context, sessionID string, streamID int)
+	ChatSessionStatus(ctx context.Context, sessionID string) (models.ChatSessionStatus, error)
+	DecideApproval(ctx context.Context, approvalID string, decision models.ApprovalDecision) (models.ApprovalDecisionResult, error)
+	SendMessageStream(ctx context.Context, message string, chatSessionID *string, agentID int, parentMessageID *int, fileDescriptors []models.FileDescriptorPayload, llmOverride *models.LLMOverride) <-chan models.StreamEvent
+	ResumeChatStream(ctx context.Context, sessionID string, streamID *int, cursor int) <-chan models.StreamEvent
+	Search(ctx context.Context, req models.SearchRequest) (*models.SearchResponse, error)
+	GenerateImage(ctx context.Context, req models.ImageGenerationRequest) (*models.ImageGenerationResponse, error)
+}
+
+var _ ClientAPI = (*Client)(nil)

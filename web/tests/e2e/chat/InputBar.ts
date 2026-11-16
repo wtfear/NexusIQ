@@ -1,0 +1,437 @@
+/**
+ * Page Object Model for the chat input bar.
+ *
+ * Encapsulates locators and interactions for the contentEditable input,
+ * paste tiles, tile popover, and resize behavior. Designed to be
+ * instantiated on ChatPage as `chatPage.inputBar`.
+ */
+
+import { type Page, type Locator, expect } from "@playwright/test";
+
+const POLL_TIMEOUT = 5000;
+
+/**
+ * Auto-retrying assertion for values that have no built-in Playwright
+ * locator assertion (e.g. computed heights, scrollHeight comparisons,
+ * innerHTML checks). Prefer locator assertions like `toHaveClass`,
+ * `toHaveAttribute`, `toContainText` when one exists — they are
+ * faster and produce better error messages.
+ */
+function poll<T>(fn: () => Promise<T>) {
+  return expect.poll(fn, { timeout: POLL_TIMEOUT });
+}
+
+export class InputBar {
+  readonly page: Page;
+
+  readonly container: Locator;
+  readonly textbox: Locator;
+  readonly sendButton: Locator;
+  readonly processingFileChips: Locator;
+  readonly queuedMessages: Locator;
+  readonly pendingMessageHint: Locator;
+  readonly subagentActivity: Locator;
+  readonly stopSubagentsButton: Locator;
+  readonly skillPicker: Locator;
+
+  readonly tile: Locator;
+  readonly tileRemoveButton: Locator;
+  readonly tilePopover: Locator;
+  readonly tilePopoverTextarea: Locator;
+  readonly tilePopoverBackdrop: Locator;
+  readonly tilePopoverExpandButton: Locator;
+  readonly tilePreview: Locator;
+  readonly tileMeta: Locator;
+
+  constructor(page: Page) {
+    this.page = page;
+    this.container = page.locator("#onyx-chat-input");
+    this.textbox = page.locator("#onyx-chat-input-textbox");
+    this.sendButton = page.locator("#onyx-chat-input-send-button");
+    this.processingFileChips = this.container.getByText("Processing...");
+    this.subagentActivity = page.getByTestId("subagent-activity");
+    this.stopSubagentsButton = this.subagentActivity.getByRole("button", {
+      name: "Stop subagents",
+      exact: true,
+    });
+    this.queuedMessages = page.getByTestId("queued-message-bar");
+    this.pendingMessageHint = this.container.getByTestId(
+      "pending-message-hint"
+    );
+
+    this.skillPicker = page.getByTestId("skill-picker-popover");
+
+    this.tile = page.locator("[data-rich-tile]");
+    this.tileRemoveButton = page.locator("[data-rich-tile-remove]");
+    this.tilePopover = page.locator(
+      "[role='dialog'][aria-label='Edit pasted text']"
+    );
+    this.tilePopoverTextarea = this.tilePopover.locator("textarea");
+    this.tilePopoverBackdrop = page.getByTestId("paste-tile-backdrop");
+    this.tilePopoverExpandButton = this.tilePopover.getByRole("button", {
+      name: "Expand into input bar",
+    });
+    this.tilePreview = page.locator(".rich-input-tile-preview");
+    this.tileMeta = page.locator(".rich-input-tile-meta");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Text input
+  // ---------------------------------------------------------------------------
+
+  async fill(text: string): Promise<void> {
+    await this.textbox.fill(text);
+  }
+
+  async typeText(text: string): Promise<void> {
+    await this.textbox.focus();
+    await this.page.keyboard.type(text);
+  }
+
+  async focus(): Promise<void> {
+    await this.textbox.focus();
+  }
+
+  /** Presses a key in the input, where the caret is. */
+  async press(key: string): Promise<void> {
+    await this.textbox.press(key);
+  }
+
+  /** Clicks the text so the caret lands before character `offset`. */
+  async clickAtTextOffset(offset: number): Promise<void> {
+    const point = await this.textbox.evaluate((el, at) => {
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      let remaining = at;
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const length = node.textContent?.length ?? 0;
+        if (remaining < length) {
+          const range = document.createRange();
+          range.setStart(node, remaining);
+          range.setEnd(node, remaining + 1);
+          const rect = range.getBoundingClientRect();
+          // The left part of a character puts the caret before it.
+          return {
+            x: rect.left + rect.width / 4,
+            y: rect.top + rect.height / 2,
+          };
+        }
+        remaining -= length;
+      }
+      throw new Error(`No character at offset ${at}`);
+    }, offset);
+    await this.page.mouse.click(point.x, point.y);
+  }
+
+  async clear(): Promise<void> {
+    await this.textbox.focus();
+    await this.page.keyboard.press("ControlOrMeta+a");
+    await this.page.keyboard.press("Backspace");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Paste
+  // ---------------------------------------------------------------------------
+
+  async paste(text: string): Promise<void> {
+    await this.page.evaluate((t) => {
+      const el = document.getElementById("onyx-chat-input-textbox")!;
+      el.focus();
+      const dt = new DataTransfer();
+      dt.setData("text/plain", t);
+      el.dispatchEvent(
+        new ClipboardEvent("paste", {
+          clipboardData: dt,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+    }, text);
+  }
+
+  async pastePlain(text: string): Promise<void> {
+    await this.page.evaluate((t) => {
+      const el = document.getElementById("onyx-chat-input-textbox")!;
+      el.focus();
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "V",
+          code: "KeyV",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+      const dt = new DataTransfer();
+      dt.setData("text/plain", t);
+      el.dispatchEvent(
+        new ClipboardEvent("paste", {
+          clipboardData: dt,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+    }, text);
+  }
+
+  async armPlainPaste(): Promise<void> {
+    await this.page.evaluate(() => {
+      const el = document.getElementById("onyx-chat-input-textbox")!;
+      el.focus();
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "V",
+          code: "KeyV",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+    });
+  }
+
+  async pasteHtml(html: string, plainText: string): Promise<void> {
+    await this.page.evaluate(
+      ({ html, plain }) => {
+        const el = document.getElementById("onyx-chat-input-textbox")!;
+        el.focus();
+        const dt = new DataTransfer();
+        dt.setData("text/html", html);
+        dt.setData("text/plain", plain);
+        el.dispatchEvent(
+          new ClipboardEvent("paste", {
+            clipboardData: dt,
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+      },
+      { html, plain: plainText }
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Submission
+  // ---------------------------------------------------------------------------
+
+  async stopSubagents(): Promise<void> {
+    await this.stopSubagentsButton.click();
+  }
+
+  async send(): Promise<void> {
+    await this.page.keyboard.press("Enter");
+  }
+
+  async queue(): Promise<void> {
+    await this.textbox.press("ControlOrMeta+Enter");
+  }
+
+  async selectPreviousPending(): Promise<void> {
+    await this.textbox.press("ArrowUp");
+  }
+
+  async discardSelectedPending(): Promise<void> {
+    await this.textbox.press("Delete");
+  }
+
+  async submitPending(
+    text: string,
+    delivery: "queue" | "send" = "queue"
+  ): Promise<void> {
+    await this.textbox.fill(text);
+    if (delivery === "queue") await this.queue();
+    else await this.send();
+    await expect(this.textbox).toHaveText("");
+    // The composer holds new input until the server accepts this one.
+    await expect(
+      this.queuedMessages.getByText(text, { exact: true })
+    ).toBeVisible();
+  }
+
+  async discardPending(index: number): Promise<void> {
+    await this.queuedMessages
+      .nth(index)
+      .getByRole("button", { name: /^Remove queued message: / })
+      .click();
+  }
+
+  async editPending(index: number): Promise<void> {
+    await this.queuedMessages
+      .nth(index)
+      .getByRole("button", { name: /^Edit queued message: / })
+      .click();
+  }
+
+  async clickSend(): Promise<void> {
+    await this.sendButton.click();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Skill picker
+  // ---------------------------------------------------------------------------
+
+  skillPickerRow(name: string): Locator {
+    return this.skillPicker.getByTestId(`skill-picker-row-${name}`);
+  }
+
+  /** Picks `name` by clicking its row, or with Enter on the highlighted row,
+   * which must be `name`. */
+  async pickSkill(name: string, via: "click" | "Enter"): Promise<void> {
+    if (via === "click") {
+      await this.skillPickerRow(name).click();
+    } else {
+      await expect(this.skillPickerRow(name)).toBeVisible();
+      await this.page.keyboard.press("Enter");
+    }
+    await expect(this.skillPicker).toBeHidden();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tile interactions
+  // ---------------------------------------------------------------------------
+
+  async clickTile(index = 0): Promise<void> {
+    await this.tile.nth(index).click();
+  }
+
+  async removeTile(index = 0): Promise<void> {
+    await this.tileRemoveButton.nth(index).click();
+  }
+
+  async editTileText(newText: string): Promise<void> {
+    await this.tilePopoverTextarea.fill(newText);
+  }
+
+  async expandTileViaPopover(): Promise<void> {
+    await this.tilePopoverExpandButton.click();
+  }
+
+  async dismissPopoverViaEscape(): Promise<void> {
+    await this.page.keyboard.press("Escape");
+    await expect(this.tilePopover).toHaveCount(0);
+  }
+
+  async dismissPopoverViaBackdrop(): Promise<void> {
+    await this.tilePopoverBackdrop.click();
+    await expect(this.tilePopover).toHaveCount(0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Assertions
+  // ---------------------------------------------------------------------------
+
+  async expectFocused(): Promise<void> {
+    await expect(this.textbox).toBeFocused();
+  }
+
+  async expectFileProcessing(processing = true): Promise<void> {
+    if (processing) {
+      await expect(this.processingFileChips.first()).toBeVisible();
+    } else {
+      await expect(this.processingFileChips).toHaveCount(0, {
+        timeout: 10000,
+      });
+    }
+  }
+
+  /** The composer accepts a normal send, and the empty composer cannot send. */
+  /** No turn streams, so the composer sends a normal message. */
+  async expectAcceptsSend(timeout = POLL_TIMEOUT): Promise<void> {
+    await expect(this.container).toHaveAttribute("data-accepts-send", "true", {
+      timeout,
+    });
+  }
+
+  async expectIdle(timeout = POLL_TIMEOUT): Promise<void> {
+    await this.expectAcceptsSend(timeout);
+    await expect(this.textbox).toHaveAttribute("data-empty", "");
+    await expect(this.sendButton).toBeDisabled();
+  }
+
+  async expectEmpty(): Promise<void> {
+    await expect(this.textbox).toHaveAttribute("data-empty", "");
+  }
+
+  async expectText(text: string): Promise<void> {
+    await expect(this.textbox).toContainText(text);
+  }
+
+  async expectNoText(text: string): Promise<void> {
+    await expect(this.textbox).not.toContainText(text);
+  }
+
+  async expectTileCount(count: number): Promise<void> {
+    await expect(this.tile).toHaveCount(count);
+  }
+
+  async expectTileData(text: string | RegExp, index = 0): Promise<void> {
+    await expect(this.tile.nth(index)).toHaveAttribute("data-text", text);
+  }
+
+  async expectTileSelected(selected = true): Promise<void> {
+    const assertion = expect(this.tile.first());
+    if (selected) {
+      await assertion.toHaveClass(/rich-input-tile-selected/);
+    } else {
+      await assertion.not.toHaveClass(/rich-input-tile-selected/);
+    }
+  }
+
+  async expectTileInSelection(inSelection = true): Promise<void> {
+    const assertion = expect(this.tile.first());
+    if (inSelection) {
+      await assertion.toHaveClass(/rich-input-tile-in-selection/);
+    } else {
+      await assertion.not.toHaveClass(/rich-input-tile-in-selection/);
+    }
+  }
+
+  async expectPopoverVisible(): Promise<void> {
+    await expect(this.tilePopover).toBeVisible();
+  }
+
+  async expectPopoverHidden(): Promise<void> {
+    await expect(this.tilePopover).toHaveCount(0);
+  }
+
+  async expectPopoverTextareaValue(value: string): Promise<void> {
+    await expect(this.tilePopoverTextarea).toHaveValue(value);
+  }
+
+  private getWrapperHeight(): Promise<number> {
+    return this.page.evaluate(() => {
+      const el = document.getElementById("onyx-chat-input-textbox")!;
+      return el.parentElement!.getBoundingClientRect().height;
+    });
+  }
+
+  async expectHeightGreaterThan(min: number): Promise<void> {
+    await poll(() => this.getWrapperHeight()).toBeGreaterThan(min);
+  }
+
+  async expectHeightAtMost(max: number): Promise<void> {
+    await poll(() => this.getWrapperHeight()).toBeLessThanOrEqual(max);
+  }
+
+  async expectScrollable(): Promise<void> {
+    await poll(() =>
+      this.page.evaluate(() => {
+        const el = document.getElementById("onyx-chat-input-textbox")!;
+        return el.scrollHeight > el.clientHeight;
+      })
+    ).toBe(true);
+  }
+
+  /** Returns the selection collapsed state (false means something is selected). */
+  async isSelectionCollapsed(): Promise<boolean> {
+    return this.page.evaluate(() => {
+      const sel = window.getSelection();
+      return sel?.isCollapsed ?? true;
+    });
+  }
+
+  async expectInnerHtmlNotContaining(text: string): Promise<void> {
+    await poll(() => this.textbox.innerHTML()).not.toContain(text);
+  }
+}

@@ -1,0 +1,327 @@
+from uuid import uuid4
+
+import httpx
+import pytest
+
+from onyx.server.query_and_chat.models import ChatSessionCreationRequest
+from tests.integration.common_utils.constants import API_SERVER_URL, GENERAL_HEADERS
+from tests.integration.common_utils.http_client import client
+from tests.integration.common_utils.managers.chat import ChatSessionManager
+from tests.integration.common_utils.managers.user import (
+    DEFAULT_PASSWORD,
+    UserManager,
+    build_email,
+)
+from tests.integration.common_utils.reset import reset_all
+from tests.integration.common_utils.test_models import DATestUser
+
+
+@pytest.fixture(scope="module", autouse=True)
+def reset_for_module() -> None:
+    """Reset all data once before running any tests in this module."""
+    reset_all()
+
+
+@pytest.fixture
+def second_user(admin_user: DATestUser) -> DATestUser:  # noqa: ARG001
+    # Ensure admin exists so this new user is created with BASIC role.
+    try:
+        return UserManager.create(name="second_basic_user")
+    except httpx.HTTPStatusError as e:
+        response = e.response
+        if response is None:
+            raise
+        if response.status_code not in (400, 409):
+            raise
+        try:
+            payload = response.json()
+        except ValueError:
+            raise
+        detail = payload.get("detail")
+        if not _is_user_already_exists_detail(detail):
+            raise
+        print("Second basic user already exists; logging in instead.")
+        return UserManager.login_as_user(
+            DATestUser(
+                id="",
+                email=build_email("second_basic_user"),
+                password=DEFAULT_PASSWORD,
+                headers=GENERAL_HEADERS,
+                is_admin=False,
+                is_active=True,
+            )
+        )
+
+
+def _is_user_already_exists_detail(detail: object) -> bool:
+    if isinstance(detail, str):
+        normalized = detail.lower()
+        return (
+            "already exists" in normalized
+            or "register_user_already_exists" in normalized
+        )
+    if isinstance(detail, dict):
+        code = detail.get("code")
+        if isinstance(code, str) and code.lower() == "register_user_already_exists":
+            return True
+        message = detail.get("message")
+        if isinstance(message, str) and "already exists" in message.lower():
+            return True
+    return False
+
+
+def _get_chat_session(
+    chat_session_id: str,
+    user: DATestUser,
+    is_shared: bool | None = None,
+    include_deleted: bool | None = None,
+) -> httpx.Response:
+    params: dict[str, str] = {}
+    if is_shared is not None:
+        params["is_shared"] = str(is_shared).lower()
+    if include_deleted is not None:
+        params["include_deleted"] = str(include_deleted).lower()
+
+    return client.get(
+        f"{API_SERVER_URL}/chat/get-chat-session/{chat_session_id}",
+        params=params,
+        headers=user.headers,
+        cookies=user.cookies,
+    )
+
+
+def _set_sharing_status(
+    chat_session_id: str, sharing_status: str, user: DATestUser
+) -> httpx.Response:
+    return client.patch(
+        f"{API_SERVER_URL}/chat/chat-session/{chat_session_id}",
+        json={"sharing_status": sharing_status},
+        headers=user.headers,
+        cookies=user.cookies,
+    )
+
+
+def test_private_chat_session_access(
+    basic_user: DATestUser, second_user: DATestUser
+) -> None:
+    """Verify private sessions are only accessible by the owner and never via share link."""
+    # Create a private chat session owned by basic_user.
+    chat_session = ChatSessionManager.create(user_performing_action=basic_user)
+
+    # Owner can access the private session normally.
+    response = _get_chat_session(str(chat_session.id), basic_user)
+    assert response.status_code == 200
+
+    # Share link should be forbidden when the session is private.
+    response = _get_chat_session(str(chat_session.id), basic_user, is_shared=True)
+    assert response.status_code == 403
+
+    # Other users cannot access private sessions directly.
+    response = _get_chat_session(str(chat_session.id), second_user)
+    assert response.status_code == 403
+
+    # Other users also cannot access private sessions via share link.
+    response = _get_chat_session(str(chat_session.id), second_user, is_shared=True)
+    assert response.status_code == 403
+
+
+def test_public_shared_chat_session_access(
+    basic_user: DATestUser, second_user: DATestUser
+) -> None:
+    """Verify shared sessions are accessible only via share link for non-owners."""
+    # Create a private session, then mark it public.
+    chat_session = ChatSessionManager.create(user_performing_action=basic_user)
+
+    response = _set_sharing_status(str(chat_session.id), "public", basic_user)
+    assert response.status_code == 200
+
+    # Owner can access normally.
+    response = _get_chat_session(str(chat_session.id), basic_user)
+    assert response.status_code == 200
+
+    # Owner can also access via share link.
+    response = _get_chat_session(str(chat_session.id), basic_user, is_shared=True)
+    assert response.status_code == 200
+
+    # Non-owner cannot access without share link.
+    response = _get_chat_session(str(chat_session.id), second_user)
+    assert response.status_code == 403
+
+    # Non-owner can access with share link for public sessions.
+    response = _get_chat_session(str(chat_session.id), second_user, is_shared=True)
+    assert response.status_code == 200
+
+
+def test_deleted_chat_session_access(
+    basic_user: DATestUser, second_user: DATestUser
+) -> None:
+    """Verify deleted sessions return 404, with include_deleted gated by access checks."""
+    # Create and soft-delete a session.
+    chat_session = ChatSessionManager.create(user_performing_action=basic_user)
+
+    deletion_success = ChatSessionManager.soft_delete(
+        chat_session=chat_session, user_performing_action=basic_user
+    )
+    assert deletion_success is True
+
+    # Deleted sessions are not accessible normally.
+    response = _get_chat_session(str(chat_session.id), basic_user)
+    assert response.status_code == 404
+
+    # Owner can fetch deleted session only with include_deleted.
+    response = _get_chat_session(str(chat_session.id), basic_user, include_deleted=True)
+    assert response.status_code == 200
+    assert response.json().get("deleted") is True
+
+    # Non-owner should be blocked even with include_deleted.
+    response = _get_chat_session(
+        str(chat_session.id), second_user, include_deleted=True
+    )
+    assert response.status_code == 403
+
+
+def test_chat_session_not_found_returns_404(basic_user: DATestUser) -> None:
+    """Verify unknown IDs return 404."""
+    response = _get_chat_session(str(uuid4()), basic_user)
+    assert response.status_code == 404
+
+
+def _stop_chat_session(chat_session_id: str, user: DATestUser) -> httpx.Response:
+    return client.post(
+        f"{API_SERVER_URL}/chat/stop-chat-session/{chat_session_id}",
+        headers=user.headers,
+        cookies=user.cookies,
+    )
+
+
+def test_stop_chat_session_rejects_non_owner(
+    basic_user: DATestUser, second_user: DATestUser
+) -> None:
+    """Non-owner callers must not be able to stop another user's chat session."""
+    chat_session = ChatSessionManager.create(user_performing_action=basic_user)
+
+    # Owner can stop their own session.
+    response = _stop_chat_session(str(chat_session.id), basic_user)
+    assert response.status_code == 200
+
+    # A different authenticated user must not be able to stop it.
+    response = _stop_chat_session(str(chat_session.id), second_user)
+    assert response.status_code == 404
+
+    # Unknown session IDs are also rejected.
+    response = _stop_chat_session(str(uuid4()), second_user)
+    assert response.status_code == 404
+
+
+def test_queue_and_status_routes_reject_callers_without_access(
+    basic_user: DATestUser, second_user: DATestUser
+) -> None:
+    """Only the owner can read a chat's status or read and change its queue."""
+    chat_session = ChatSessionManager.create(user_performing_action=basic_user)
+    session_url = f"{API_SERVER_URL}/chat/chat-session/{chat_session.id}"
+    pending_url = f"{session_url}/pending-messages"
+
+    def status_codes(user: DATestUser | None) -> list[int]:
+        headers = user.headers if user is not None else GENERAL_HEADERS
+        cookies = user.cookies if user is not None else None
+        return [
+            client.request(
+                method, url, json=body, headers=headers, cookies=cookies
+            ).status_code
+            for method, url, body in (
+                ("GET", f"{session_url}/status", None),
+                ("GET", pending_url, None),
+                ("POST", pending_url, {"message": "Private", "delivery": "queue"}),
+                ("DELETE", f"{pending_url}/unknown", None),
+                ("POST", f"{pending_url}/unknown/interrupt", None),
+            )
+        ]
+
+    assert status_codes(second_user) == [404] * 5
+    assert status_codes(None) == [403] * 5
+    response = client.get(
+        pending_url, headers=basic_user.headers, cookies=basic_user.cookies
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"message": " ", "delivery": "queue"},
+        {
+            "message": "text",
+            "delivery": "queue",
+            "mcp_headers": {"Authorization": "test"},
+        },
+        {"message": "text", "delivery": "queue", "target_response_id": -1},
+    ],
+)
+def test_pending_message_rejects_invalid_or_transient_fields(
+    basic_user: DATestUser, body: dict[str, str | int | dict[str, str]]
+) -> None:
+    """Pending text must be nonblank and cannot carry request-only fields."""
+    chat_session = ChatSessionManager.create(user_performing_action=basic_user)
+    response = client.post(
+        f"{API_SERVER_URL}/chat/chat-session/{chat_session.id}/pending-messages",
+        json=body,
+        headers=basic_user.headers,
+        cookies=basic_user.cookies,
+    )
+    assert response.status_code == 422
+
+
+def test_queue_routes_reject_deleted_and_incognito_sessions(
+    admin_user: DATestUser,
+) -> None:
+    """Deleted chats have no queue, and incognito chats keep no pending text."""
+    security_url = f"{API_SERVER_URL}/admin/security"
+    settings = client.get(security_url, headers=admin_user.headers)
+    settings.raise_for_status()
+    previous = {
+        key: settings.json()[key]
+        for key in ("incognito_availability", "incognito_record_mode")
+    }
+    client.put(
+        security_url,
+        json={"incognito_availability": "everyone"},
+        headers=admin_user.headers,
+    ).raise_for_status()
+    try:
+        deleted = ChatSessionManager.create(user_performing_action=admin_user)
+        assert ChatSessionManager.soft_delete(
+            chat_session=deleted, user_performing_action=admin_user
+        )
+        created = client.post(
+            f"{API_SERVER_URL}/chat/create-chat-session",
+            json=ChatSessionCreationRequest(persona_id=0, incognito=True).model_dump(
+                mode="json"
+            ),
+            headers=admin_user.headers,
+        )
+        created.raise_for_status()
+        incognito_id = created.json()["chat_session_id"]
+        for chat_id, expected in ((deleted.id, 404), (incognito_id, 400)):
+            pending_url = (
+                f"{API_SERVER_URL}/chat/chat-session/{chat_id}/pending-messages"
+            )
+            assert [
+                client.request(
+                    method, url, json=body, headers=admin_user.headers
+                ).status_code
+                for method, url, body in (
+                    ("GET", pending_url, None),
+                    ("POST", pending_url, {"message": "Private", "delivery": "queue"}),
+                    ("DELETE", f"{pending_url}/unknown", None),
+                    ("POST", f"{pending_url}/unknown/interrupt", None),
+                )
+            ] == [expected] * 4
+        client.delete(
+            f"{API_SERVER_URL}/chat/delete-chat-session/{incognito_id}",
+            headers=admin_user.headers,
+        ).raise_for_status()
+    finally:
+        client.put(
+            security_url, json=previous, headers=admin_user.headers
+        ).raise_for_status()

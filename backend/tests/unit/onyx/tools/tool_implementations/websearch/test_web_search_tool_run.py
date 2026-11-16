@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import ValidationError
+
+from onyx.agents.tools import ToolInvocation
+from onyx.llm.cancellation import CancellationSignal
+from onyx.tools.models import ToolCallException, ToolContext
+from onyx.tools.tool_implementations.web_search.models import (
+    WebSearchArguments,
+    WebSearchResult,
+)
+from onyx.tools.tool_implementations.web_search.web_search_tool import WebSearchTool
+
+
+def _make_result(
+    title: str = "Title", link: str = "https://example.com"
+) -> WebSearchResult:
+    return WebSearchResult(title=title, link=link, snippet="snippet")
+
+
+def _make_tool(mock_provider: Any) -> WebSearchTool:
+    """Instantiate WebSearchTool with all DB/provider deps mocked out."""
+    provider_model = MagicMock()
+    provider_model.provider_type = "brave"
+    provider_model.api_key = MagicMock()
+    provider_model.api_key.get_value.return_value = "fake-key"
+    provider_model.config = {}
+
+    with (
+        patch(
+            "onyx.tools.tool_implementations.web_search.web_search_tool.get_session_with_current_tenant"
+        ) as mock_session_ctx,
+        patch(
+            "onyx.tools.tool_implementations.web_search.web_search_tool.fetch_active_web_search_provider",
+            return_value=provider_model,
+        ),
+        patch(
+            "onyx.tools.tool_implementations.web_search.web_search_tool.build_search_provider_from_config",
+            return_value=mock_provider,
+        ),
+    ):
+        mock_session_ctx.return_value.__enter__ = MagicMock(return_value=MagicMock())
+        mock_session_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        tool = WebSearchTool(tool_id=1)
+
+    return tool
+
+
+def _run(tool: WebSearchTool, queries: Any) -> list[str]:
+    """Call tool.run() and return the list of query strings passed to provider.search."""
+    tool_context = ToolContext(next_citation_num=1)
+    tool.run(
+        invocation=ToolInvocation(
+            call_id="test",
+            arguments={"queries": queries},
+            cancellation=CancellationSignal(),
+            update=lambda _progress: None,
+        ),
+        context=tool_context,
+    )
+    search_mock = cast(MagicMock, tool._provider.search)  # noqa: SLF001
+    return [call.args[0] for call in search_mock.call_args_list]
+
+
+@pytest.mark.parametrize(
+    ("raw", "queries"),
+    [
+        ("hello", ["hello"]),
+        ("  hello  ", ["hello"]),
+        # Control characters are removed without inserting a space.
+        ("hello\x00world", ["helloworld"]),
+        (["a", "b"], ["a", "b"]),
+        (["  a  ", "b\tb"], ["a", "bb"]),
+        (["a", None, "b"], ["a", "b"]),
+        ([1, "two"], ["1", "two"]),
+        (["a", "", "  ", "b"], ["a", "b"]),
+    ],
+)
+def test_queries_are_coerced_and_sanitized(raw: Any, queries: list[str]) -> None:
+    assert WebSearchArguments.model_validate({"queries": raw}).queries == queries
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ["", "  "], None, 42, {}])
+def test_no_query_left_is_a_missing_argument(raw: Any) -> None:
+    with pytest.raises(ValidationError, match="Field required"):
+        WebSearchArguments.model_validate({"queries": raw})
+
+
+class TestWebSearchToolRunQueryCoercion:
+    def test_list_of_strings_dispatches_each_query(self) -> None:
+        """Normal case: list of queries → one search call per query."""
+        mock_provider = MagicMock()
+        mock_provider.search.return_value = [_make_result()]
+        mock_provider.supports_site_filter = False
+        tool = _make_tool(mock_provider)
+
+        dispatched = _run(tool, ["python decorators", "python generators"])
+
+        # run_functions_tuples_in_parallel uses a thread pool; call_args_list order is non-deterministic.
+        assert sorted(dispatched) == ["python decorators", "python generators"]
+
+    def test_bare_string_dispatches_as_single_query(self) -> None:
+        """LLM returns a bare string instead of an array — must NOT be split char-by-char."""
+        mock_provider = MagicMock()
+        mock_provider.search.return_value = [_make_result()]
+        mock_provider.supports_site_filter = False
+        tool = _make_tool(mock_provider)
+
+        dispatched = _run(tool, "what is the capital of France")
+
+        assert len(dispatched) == 1
+        assert dispatched[0] == "what is the capital of France"
+
+    def test_bare_string_does_not_search_individual_characters(self) -> None:
+        """Regression: single-char searches must not occur."""
+        mock_provider = MagicMock()
+        mock_provider.search.return_value = [_make_result()]
+        mock_provider.supports_site_filter = False
+        tool = _make_tool(mock_provider)
+
+        dispatched = _run(tool, "hi")
+        for query_arg in dispatched:
+            assert len(query_arg) > 1, (
+                f"Single-character query dispatched: {query_arg!r}"
+            )
+
+    def test_control_characters_sanitized_before_dispatch(self) -> None:
+        """Queries with control chars have those chars removed before dispatch."""
+        mock_provider = MagicMock()
+        mock_provider.search.return_value = [_make_result()]
+        mock_provider.supports_site_filter = False
+        tool = _make_tool(mock_provider)
+
+        dispatched = _run(tool, ["foo\x00bar", "baz\tbaz"])
+
+        # run_functions_tuples_in_parallel uses a thread pool; call_args_list is in
+        # execution order, not submission order, so compare in sorted order.
+        assert sorted(dispatched) == ["bazbaz", "foobar"]
+
+    def test_all_empty_or_whitespace_raises_tool_call_exception(self) -> None:
+        """When normalization yields no valid queries, run() raises ToolCallException."""
+        mock_provider = MagicMock()
+        mock_provider.supports_site_filter = False
+        tool = _make_tool(mock_provider)
+        tool_context = ToolContext(next_citation_num=1)
+
+        with pytest.raises(ToolCallException) as exc_info:
+            tool._run(
+                invocation=ToolInvocation(
+                    call_id="test",
+                    arguments={"queries": "   "},
+                    cancellation=CancellationSignal(),
+                    update=lambda _progress: None,
+                ),
+                context=tool_context,
+            )
+
+        assert "queries: Field required" in str(exc_info.value)
+        cast(MagicMock, mock_provider.search).assert_not_called()

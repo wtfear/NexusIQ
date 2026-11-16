@@ -1,0 +1,71 @@
+{{- if .Values.monitoring.grafana.dashboards.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "onyx.resourceName" (list . "indexing-pipeline-dashboard") }}
+  labels:
+    {{- include "onyx.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Onyx"
+data:
+  onyx-indexing-pipeline.json: |
+    {{- .Files.Get "dashboards/indexing-pipeline.json" | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "onyx.resourceName" (list . "opensearch-search-latency-dashboard") }}
+  labels:
+    {{- include "onyx.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Onyx"
+data:
+  onyx-opensearch-search-latency.json: |
+    {{- .Files.Get "dashboards/opensearch-search-latency.json" | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "onyx.resourceName" (list . "redis-queues-dashboard") }}
+  labels:
+    {{- include "onyx.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Onyx"
+data:
+  onyx-redis-queues.json: |
+    {{- .Files.Get "dashboards/redis-queues.json" | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "onyx.resourceName" (list . "indexing-pruning-dashboard") }}
+  labels:
+    {{- include "onyx.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Onyx"
+data:
+  onyx-indexing-pruning.json: |
+    {{- .Files.Get "dashboards/indexing-pruning.json" | nindent 4 }}
+{{- $fcMetrics := dig "hostAgent" "metrics" "enabled" false (.Values.craft | default dict) }}
+{{- if and (eq (include "onyx.craftSandboxRuntime" .) "firecracker") $fcMetrics }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "onyx.resourceName" (list . "craft-fc-host-agent-dashboard") }}
+  labels:
+    {{- include "onyx.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: "Onyx"
+data:
+  onyx-craft-fc-host-agent.json: |
+    {{- /* The default job is the agent Service name, which can be truncated. */}}
+    {{- .Files.Get "dashboards/craft-fc-host-agent.json" | replace "__CRAFT_FC_HOST_AGENT_JOB__" (include "onyx.craftHostAgentMetricsJob" .) | replace "__CRAFT_FC_HOST_AGENT_DAEMONSET__" (include "onyx.resourceName" (list . "craft-fc-host-agent")) | nindent 4 }}
+{{- end }}
+{{- end }}
