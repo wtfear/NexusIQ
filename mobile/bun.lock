@@ -35,7 +35,7 @@
         "expo-secure-store": "~57.0.1",
         "expo-splash-screen": "~57.0.7",
         "expo-status-bar": "~57.0.1",
-        "expo-system-ui": "~57.0.2",
+        "expo-system-ui": "~58.0.7",
         "expo-web-browser": "~57.0.2",
         "nativewind": "^4.2.6",
         "react": "19.2.3",
@@ -555,7 +555,7 @@
 
     "@react-native/metro-config": ["@react-native/metro-config@0.87.0", "", { "dependencies": { "@react-native/js-polyfills": "0.87.0", "@react-native/metro-babel-transformer": "0.87.0", "metro-config": "^0.87.0", "metro-runtime": "^0.87.0" } }, "sha512-Pg0DmsJ/DbLP8JuxnRSDmrIaQjKhpzd2uYAZRyB2A8fJQzJWpAFLr7TUAXhiGD5025F6+PVPAnJL3HXaeMfZqQ=="],
 
-    "@react-native/normalize-colors": ["@react-native/normalize-colors@0.86.2", "", {}, "sha512-EzPFc9Y6lzYOWeso2almwXI7f8+qReHxWvT+algsOczb2UhWXIWXDoSvkdwoSfiwwmGt/ijJgKJoeHlzPkLwRg=="],
+    "@react-native/normalize-colors": ["@react-native/normalize-colors@0.88.1", "", {}, "sha512-2SAKiLyZRf+peBLkhhJWGY5vC26w1Uj9QBgUZvjAnOxjgeEKUGBE5riPS0R7+YoqSrRL0w8ucwZB4M+vvy9HMg=="],
 
     "@react-native/virtualized-lists": ["@react-native/virtualized-lists@0.86.2", "", { "dependencies": { "invariant": "^2.2.4", "nullthrows": "^1.1.1" }, "peerDependencies": { "@types/react": "^19.2.0", "react": "*", "react-native": "0.86.2" }, "optionalPeers": ["@types/react"] }, "sha512-uO0J72gh3EvE+1/GHRk18QRyBDTRHRB0AraAfojsRjbT7VMuJwKrZYaKGshavoaEud6aw00ZB9/8mTMIKjjcAw=="],
 
@@ -1183,7 +1183,7 @@
 
     "expo-symbols": ["expo-symbols@57.0.2", "", { "dependencies": { "@expo-google-fonts/material-symbols": "^0.4.1", "sf-symbols-typescript": "^2.0.0" }, "peerDependencies": { "expo": "*", "expo-font": "*", "react": "*", "react-native": "*" } }, "sha512-qZ0iqOflm5lZGwRsQ5Y8sDksw3GAUKwHSX1bJBoocXf7gu14vafIXXYWte+JT9VfXAUGyKodJhLHP/GoOrcNWg=="],
 
-    "expo-system-ui": ["expo-system-ui@57.0.2", "", { "dependencies": { "@react-native/normalize-colors": "0.86.2", "debug": "^4.3.2" }, "peerDependencies": { "expo": "*", "react-native": "*", "react-native-web": "*" }, "optionalPeers": ["react-native-web"] }, "sha512-zABCRqFSioDBAo/RtmS0dQiGgDtDPZUVk01Y3Ti4ducobNM4HTM2sNAtq+YPpEUhaVW3hccPVsEUH4LK/ADVhA=="],
+    "expo-system-ui": ["expo-system-ui@58.0.7", "", { "dependencies": { "@react-native/normalize-colors": "0.88.1", "debug": "^4.3.2" }, "peerDependencies": { "expo": "*", "react-native": "*", "react-native-web": "*" }, "optionalPeers": ["react-native-web"] }, "sha512-XxrMY93bT8MpZUlc6uRKzkeUoXhBi/Eq8j3qx2pjk0ARCV+0Ed1eqzmgxuAoKZ+10cyOZVSke5Hhi78NVFReuQ=="],
 
     "expo-updates-interface": ["expo-updates-interface@57.0.1", "", { "peerDependencies": { "expo": "*" } }, "sha512-+LUWwJ0gf/TEKMVdQAw/Gjih4dvrk+URgy24X9qEGKuuMDZqjBRm9T4yQyBVALGL5TTdPUaB6ILxx3lshm3pwQ=="],
 
@@ -2281,6 +2281,8 @@
 
     "@expo/plist/xmlbuilder": ["xmlbuilder@15.1.1", "", {}, "sha512-yMqGBqtXyeN1e3TGYvgNgDVZ3j84W4cwkOXQswghol6APgZWaff9lnbvN7MHYJOiXsvGPXtjTYJEiC9J2wv9Eg=="],
 
+    "@expo/prebuild-config/@react-native/normalize-colors": ["@react-native/normalize-colors@0.86.2", "", {}, "sha512-EzPFc9Y6lzYOWeso2almwXI7f8+qReHxWvT+algsOczb2UhWXIWXDoSvkdwoSfiwwmGt/ijJgKJoeHlzPkLwRg=="],
+
     "@expo/ws-tunnel/ws": ["ws@8.21.3", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-201TZ/kPWxoPr/OKWjquZR1SWKXcvxdH+e1xrx89b3YbmzLMFCLfnaG1HFIgWzJOEWZ7MvpK++odZufgYR50Rw=="],
 
     "@istanbuljs/load-nyc-config/camelcase": ["camelcase@5.3.1", "", {}, "sha512-L28STB170nwWS63UjtlEOE3dldQApaJXZkOI1uMFfzf3rRuPegHaHesyee+YxQ+W6SvRDQV6UrdOdRiR153wJg=="],
@@ -2484,6 +2486,8 @@
     "plist/xmlbuilder": ["xmlbuilder@15.1.1", "", {}, "sha512-yMqGBqtXyeN1e3TGYvgNgDVZ3j84W4cwkOXQswghol6APgZWaff9lnbvN7MHYJOiXsvGPXtjTYJEiC9J2wv9Eg=="],
 
     "prop-types/react-is": ["react-is@16.13.1", "", {}, "sha512-24e6ynE2H+OKt4kqsOvNd8kBpV65zoxbA4BVsEOB3ARVWQki/DHzaUoC5KuON/BiccDaCCTZBuOcfZs70kR8bQ=="],
+
+    "react-native/@react-native/normalize-colors": ["@react-native/normalize-colors@0.86.2", "", {}, "sha512-EzPFc9Y6lzYOWeso2almwXI7f8+qReHxWvT+algsOczb2UhWXIWXDoSvkdwoSfiwwmGt/ijJgKJoeHlzPkLwRg=="],
 
     "react-native/pretty-format": ["pretty-format@29.7.0", "", { "dependencies": { "@jest/schemas": "^29.6.3", "ansi-styles": "^5.0.0", "react-is": "^18.0.0" } }, "sha512-Pdlw/oPxN+aXdmM9R00JVC9WVFoCLTKJvDVLgmJ+qAffBMxsV85l/Lu7sNx4zSzPyoL2euImuEwHhOXdEgNFZQ=="],
 
