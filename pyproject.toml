@@ -52,7 +52,7 @@ backend = [
     "fastmcp==3.4.10",
     "google-api-python-client==2.86.0",
     "google-auth-oauthlib==1.4.0",
-    "google-cloud-storage>=3.0.0,<4.0.0",
+    "google-cloud-storage>=3.17.1,<4.0.0",
     "graphql-core==3.2.12",
     # Craft Firecracker host agent client (backend/onyx/microvm/). The
     # generated stubs need protobuf; googleapis-common-protos has ErrorInfo.
