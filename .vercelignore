@@ -1,0 +1,12 @@
+bun.lock
+uv.lock
+.python-version
+pyproject.toml
+backend/
+web/
+cli/
+desktop/
+mobile/
+microvm/
+widget/
+examples/
